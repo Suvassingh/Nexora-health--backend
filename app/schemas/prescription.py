@@ -36,3 +36,17 @@ class PrescriptionResponse(BaseModel):
     follow_up_date: Optional[date]
     issued_at: datetime
     items: List[PrescriptionItemResponse]
+    
+class PrescriptionItemInput(BaseModel):
+    medicine_name: str
+    dosage:        Optional[str] = None
+    frequency:     Optional[str] = None
+    duration_days: Optional[int] = None
+    instructions:  Optional[str] = None
+
+class DirectPrescriptionCreate(BaseModel):
+    patient_id:     str
+    diagnosis:      str
+    notes:          Optional[str] = None
+    follow_up_date: Optional[date] = None
+    items:          List[PrescriptionItemInput] = []

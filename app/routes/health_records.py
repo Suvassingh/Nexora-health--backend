@@ -1,75 +1,23 @@
-
-
 from __future__ import annotations
 
 from datetime import datetime, timezone, date
-from typing import Optional
+from typing import Optional, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from app.core.dependencies import get_current_user, get_current_doctor
 from app.database.supabase_client import supabase
-from pydantic import BaseModel
+from app.schemas.health_record import AllergyCreate, ConditionCreate, FamilyHistoryCreate, HistoryEntryCreate, ImmunisationCreate, VitalsCreate
 
 router = APIRouter()
 
 
-# PYDANTIC MODELS  
-
-class AllergyCreate(BaseModel):
-    allergen:  str
-    reaction:  Optional[str] = None
-    severity:  str = "moderate"
-    notes:     Optional[str] = None
-
-class ConditionCreate(BaseModel):
-    condition_name: str
-    icd_code:       Optional[str] = None
-    diagnosed_date: Optional[date] = None
-    status:         str = "active"
-    notes:          Optional[str] = None
-
-class VitalsCreate(BaseModel):
-    patient_id:     str
-    appointment_id: Optional[str] = None
-    bp_systolic:    Optional[int] = None
-    bp_diastolic:   Optional[int] = None
-    heart_rate:     Optional[int] = None
-    spo2:           Optional[int] = None
-    temperature_c:  Optional[float] = None
-    weight_kg:      Optional[float] = None
-    height_cm:      Optional[float] = None
-    notes:          Optional[str] = None
-
-class HistoryEntryCreate(BaseModel):
-    patient_id:          str
-    consultation_id:     Optional[str] = None
-    appointment_id:      Optional[str] = None
-    chief_complaint:     Optional[str] = None
-    history_of_illness:  Optional[str] = None
-    examination_notes:   Optional[str] = None
-    diagnosis:           str
-    icd_code:            Optional[str] = None
-    treatment_plan:      Optional[str] = None
-    follow_up_days:      Optional[int] = None
-    consultation_type:   Optional[str] = None
-
-class FamilyHistoryCreate(BaseModel):
-    relation:  str
-    condition: str
-    notes:     Optional[str] = None
-
-class ImmunisationCreate(BaseModel):
-    patient_id:      str
-    vaccine_name:    str
-    dose_number:     int = 1
-    administered_at: Optional[datetime] = None
-    batch_number:    Optional[str] = None
-    next_due_date:   Optional[date] = None
-    notes:           Optional[str] = None
 
 
-# ACCESS GUARD  
+
+
 
 def _assert_access(patient_id: str, current_user: dict) -> None:
     """
@@ -529,6 +477,7 @@ async def delete_family_history(
     entry_id: str,
     current_user=Depends(get_current_user),
 ):
+    
     _assert_access(patient_id, current_user)
     supabase.table("patient_family_history").delete().eq("id", entry_id).eq("patient_id", patient_id).execute()
 
@@ -571,4 +520,326 @@ async def record_immunisation(
         "notes":           data.notes,
     }.items() if v is not None}
     res = supabase.table("patient_immunisations").insert(payload).execute()
+    return res.data[0]
+
+  
+
+
+class AllergyUpdate(BaseModel):
+    allergen:  Optional[str]  = None
+    reaction:  Optional[str]  = None
+    severity:  Optional[str]  = None   
+    notes:     Optional[str]  = None
+    is_active: Optional[bool] = None
+
+
+class ConditionUpdate(BaseModel):
+    condition_name: Optional[str]  = None
+    icd_code:       Optional[str]  = None
+    diagnosed_date: Optional[date] = None
+    status:         Optional[str]  = None   
+    notes:          Optional[str]  = None
+
+
+class VitalsUpdate(BaseModel):
+    bp_systolic:   Optional[int]   = None
+    bp_diastolic:  Optional[int]   = None
+    heart_rate:    Optional[int]   = None
+    spo2:          Optional[int]   = None
+    temperature_c: Optional[float] = None
+    weight_kg:     Optional[float] = None
+    height_cm:     Optional[float] = None
+    notes:         Optional[str]   = None
+
+
+class HistoryUpdate(BaseModel):
+    chief_complaint:     Optional[str] = None
+    history_of_illness:  Optional[str] = None
+    examination_notes:   Optional[str] = None
+    diagnosis:           Optional[str] = None
+    icd_code:            Optional[str] = None
+    treatment_plan:      Optional[str] = None
+    follow_up_days:      Optional[int] = None
+    consultation_type:   Optional[str] = None
+
+
+class FamilyHistoryUpdate(BaseModel):
+    relation:  Optional[str] = None
+    condition: Optional[str] = None
+    notes:     Optional[str] = None
+
+
+class ImmunisationUpdate(BaseModel):
+    vaccine_name:    Optional[str]      = None
+    dose_number:     Optional[int]      = None
+    administered_at: Optional[datetime] = None
+    batch_number:    Optional[str]      = None
+    next_due_date:   Optional[date]     = None
+    notes:           Optional[str]      = None
+
+
+
+def _assert_access(patient_id: str, current_user: dict) -> None:
+    """
+    Raises 403 if the caller cannot access this patient's record.
+    (Identical to the guard in health_records.py – skip if merging.)
+    """
+    if current_user["role"] == "patient":
+        if patient_id != current_user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only access your own health record",
+            )
+        return
+
+    if current_user["role"] != "doctor":
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    doctor_res = (
+        supabase.table("doctors")
+        .select("id, healthpost_id, is_active")
+        .eq("user_id", current_user["id"])
+        .maybe_single()
+        .execute()
+    )
+    if not doctor_res or not doctor_res.data:
+        raise HTTPException(status_code=403, detail="Doctor record not found")
+
+    doctor = doctor_res.data
+    if not doctor["is_active"]:
+        raise HTTPException(status_code=403, detail="Your doctor account is inactive")
+    if not doctor["healthpost_id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is not assigned to a healthpost",
+        )
+
+    access_check = (
+        supabase.table("appointments")
+        .select("id")
+        .eq("patient_id",    patient_id)
+        .eq("doctor_id",     doctor["id"])
+        .eq("healthpost_id", doctor["healthpost_id"])
+        .not_.in_("status", ["cancelled", "no_show"])
+        .limit(1)
+        .execute()
+    )
+    if not access_check.data:
+        raise HTTPException(
+            status_code=403,
+            detail="This patient has no appointments with you",
+        )
+
+
+
+@router.patch("/vitals/{vitals_id}")
+async def update_vitals(
+    vitals_id: str,
+    data: VitalsUpdate,
+    current=Depends(get_current_doctor),
+):
+    """Doctor updates an existing vitals record."""
+    # Fetch the row first to grab patient_id for the access check
+    row_res = (
+        supabase.table("patient_vitals")
+        .select("patient_id")
+        .eq("id", vitals_id)
+        .maybe_single()
+        .execute()
+    )
+    if not row_res or not row_res.data:
+        raise HTTPException(status_code=404, detail="Vitals record not found")
+
+    patient_id = row_res.data["patient_id"]
+    _assert_access(patient_id, current["user"])
+
+    payload = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    res = (
+        supabase.table("patient_vitals")
+        .update(payload)
+        .eq("id", vitals_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Vitals record not found")
+    return res.data[0]
+
+
+
+@router.patch("/{patient_id}/allergies/{allergy_id}/edit")
+async def edit_allergy(
+    patient_id: str,
+    allergy_id: str,
+    data: AllergyUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Full-field allergy update (doctors only in practice; guard enforced)."""
+    _assert_access(patient_id, current_user)
+
+    payload = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = (
+        supabase.table("patient_allergies")
+        .update(payload)
+        .eq("id",         allergy_id)
+        .eq("patient_id", patient_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Allergy not found")
+    return res.data[0]
+
+
+
+@router.patch("/{patient_id}/conditions/{condition_id}/edit")
+async def edit_condition(
+    patient_id:   str,
+    condition_id: str,
+    data: ConditionUpdate,
+    current=Depends(get_current_doctor),
+):
+    """Full-field condition update."""
+    _assert_access(patient_id, current["user"])
+
+    if data.status and data.status not in ["active", "managed", "resolved"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    payload = {k: v for k, v in data.model_dump().items() if v is not None}
+    if data.diagnosed_date:
+        payload["diagnosed_date"] = data.diagnosed_date.isoformat()
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = (
+        supabase.table("patient_conditions")
+        .update(payload)
+        .eq("id",         condition_id)
+        .eq("patient_id", patient_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Condition not found")
+    return res.data[0]
+
+
+
+@router.patch("/history/{entry_id}")
+async def update_history_entry(
+    entry_id: str,
+    data: HistoryUpdate,
+    current=Depends(get_current_doctor),
+):
+    """Doctor edits an existing medical-history entry they authored."""
+    # Fetch to verify ownership + get patient_id
+    row_res = (
+        supabase.table("medical_history_entries")
+        .select("patient_id, doctor_id")
+        .eq("id", entry_id)
+        .maybe_single()
+        .execute()
+    )
+    if not row_res or not row_res.data:
+        raise HTTPException(status_code=404, detail="History entry not found")
+
+    row = row_res.data
+    _assert_access(row["patient_id"], current["user"])
+
+    # Only the authoring doctor may edit
+    if row["doctor_id"] != current["doctor"]["id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only edit history entries you created",
+        )
+
+    payload = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    res = (
+        supabase.table("medical_history_entries")
+        .update(payload)
+        .eq("id", entry_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    return res.data[0]
+
+
+
+@router.patch("/{patient_id}/family-history/{entry_id}")
+async def update_family_history(
+    patient_id: str,
+    entry_id:   str,
+    data: FamilyHistoryUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Edit an existing family-history entry."""
+    _assert_access(patient_id, current_user)
+
+    payload = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = (
+        supabase.table("patient_family_history")
+        .update(payload)
+        .eq("id",         entry_id)
+        .eq("patient_id", patient_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Family history entry not found")
+    return res.data[0]
+
+
+
+@router.patch("/immunisations/{imm_id}")
+async def update_immunisation(
+    imm_id: str,
+    data: ImmunisationUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Doctor edits an existing immunisation record."""
+    if current_user["role"] == "patient":
+        raise HTTPException(status_code=403, detail="Only staff can edit immunisations")
+
+    row_res = (
+        supabase.table("patient_immunisations")
+        .select("patient_id")
+        .eq("id", imm_id)
+        .maybe_single()
+        .execute()
+    )
+    if not row_res or not row_res.data:
+        raise HTTPException(status_code=404, detail="Immunisation record not found")
+
+    patient_id = row_res.data["patient_id"]
+    _assert_access(patient_id, current_user)
+
+    payload = {k: v for k, v in data.model_dump().items() if v is not None}
+    if data.administered_at:
+        payload["administered_at"] = data.administered_at.isoformat()
+    if data.next_due_date:
+        payload["next_due_date"] = data.next_due_date.isoformat()
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = (
+        supabase.table("patient_immunisations")
+        .update(payload)
+        .eq("id", imm_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Immunisation record not found")
     return res.data[0]
