@@ -13,15 +13,10 @@ router = APIRouter()
 @router.post("/direct")
 async def create_direct_prescription(
     data: DirectPrescriptionCreate,
-    current = Depends(get_current_doctor),   # doctor only
+    current=Depends(get_current_doctor),
 ):
-    """
-    Create a prescription directly from the health record screen.
-    This endpoint is only for doctors.
-    """
     doctor = current["doctor"]
 
-    # Verify doctor has access to this patient (must have an appointment)
     access = (
         supabase.table("appointments")
         .select("id")
@@ -37,7 +32,6 @@ async def create_direct_prescription(
             detail="You do not have a valid appointment with this patient",
         )
 
-    # Insert prescription
     prescription_payload = {
         "patient_id":     data.patient_id,
         "doctor_id":      doctor["id"],
@@ -51,7 +45,6 @@ async def create_direct_prescription(
 
     prescription_id = res.data[0]["id"]
 
-    # Insert prescription items
     if data.items:
         items_payload = [
             {
@@ -66,7 +59,6 @@ async def create_direct_prescription(
         ]
         supabase.table("prescription_items").insert(items_payload).execute()
 
-    # Fetch the complete prescription with items
     full = supabase.table("prescriptions").select("*").eq("id", prescription_id).single().execute()
     items_res = supabase.table("prescription_items").select("*").eq("prescription_id", prescription_id).execute()
     return {**full.data, "items": items_res.data or []}
@@ -76,54 +68,57 @@ async def create_direct_prescription(
 async def get_patient_prescriptions(
     patient_id: str,
     limit: int = 10,
-    current_user = Depends(get_current_user),   # accepts doctor OR patient
+    current_user=Depends(get_current_user),
 ):
-    """
-    Fetch all prescriptions for a patient.
-    - Doctors: must have an appointment with the patient.
-    - Patients: can only see their own records.
-    """
     user = current_user
-    # Determine role – handle both "role" and "user_role" keys
     role = user.get("role") or user.get("user_role")
     user_id = user.get("id")
 
-    #  Patient access 
-    if role == "patient" or (role is None and user_id == patient_id):
+    if role == "patient":
+        # Patient can only see their own prescriptions
         if user_id != patient_id:
-            raise HTTPException(status_code=403, detail="You can only view your own prescriptions")
+            raise HTTPException(
+                status_code=403,
+                detail="You can only view your own prescriptions",
+            )
 
-    #  Doctor access 
     elif role == "doctor":
-        doctor_id = user.get("doctor", {}).get("id")
-        if not doctor_id:
-            raise HTTPException(status_code=403, detail="Doctor information missing")
+        # Look up the doctor row using user_id (get_current_user returns a flat dict)
+        doctor_res = (
+            supabase.table("doctors")
+            .select("id")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        if not doctor_res or not doctor_res.data:
+            raise HTTPException(status_code=403, detail="Doctor record not found")
 
-        # Verify doctor has an appointment with this patient
+        doctor_db_id = doctor_res.data["id"]
+
         access = (
             supabase.table("appointments")
             .select("id")
             .eq("patient_id", patient_id)
-            .eq("doctor_id", doctor_id)
+            .eq("doctor_id", doctor_db_id)
             .not_.in_("status", ["cancelled", "no_show"])
             .limit(1)
             .execute()
         )
         if not access.data:
-            raise HTTPException(status_code=403, detail="You are not the doctor of this patient")
-
-    #  Fallback (e.g. user role not set) 
-    else:
-        # If no role but the user_id equals the requested patient_id, allow access
-        if user_id == patient_id:
-            pass   # grant access
-        else:
             raise HTTPException(
                 status_code=403,
-                detail="Access denied – you are not authorised to view these prescriptions"
+                detail="You are not the doctor of this patient",
             )
 
-    #  Fetch prescriptions 
+    else:
+        # No recognised role — allow only if it's the user's own record
+        if user_id != patient_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied – you are not authorised to view these prescriptions",
+            )
+
     res = (
         supabase.table("prescriptions")
         .select(
