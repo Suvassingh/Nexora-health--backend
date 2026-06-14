@@ -1,11 +1,158 @@
+# from fastapi import APIRouter, Depends, HTTPException
+# from pydantic import BaseModel
+# from typing import Optional, List
+# from datetime import date
+
+# from app.core.dependencies import get_current_user, get_current_doctor
+# from app.database.supabase_client import supabase
+# from app.schemas.prescription import DirectPrescriptionCreate
+
+# router = APIRouter()
+
+
+# @router.post("/direct")
+# async def create_direct_prescription(
+#     data: DirectPrescriptionCreate,
+#     current=Depends(get_current_doctor),
+# ):
+#     doctor = current["doctor"]
+
+#     access = (
+#         supabase.table("appointments")
+#         .select("id")
+#         .eq("patient_id", data.patient_id)
+#         .eq("doctor_id", doctor["id"])
+#         .not_.in_("status", ["cancelled", "no_show"])
+#         .limit(1)
+#         .execute()
+#     )
+#     if not access.data:
+#         raise HTTPException(
+#             status_code=403,
+#             detail="You do not have a valid appointment with this patient",
+#         )
+
+#     prescription_payload = {
+#         "patient_id":     data.patient_id,
+#         "doctor_id":      doctor["id"],
+#         "diagnosis":      data.diagnosis,
+#         "notes":          data.notes,
+#         "follow_up_date": data.follow_up_date.isoformat() if data.follow_up_date else None,
+#     }
+#     res = supabase.table("prescriptions").insert(prescription_payload).execute()
+#     if not res.data:
+#         raise HTTPException(status_code=500, detail="Failed to create prescription")
+
+#     prescription_id = res.data[0]["id"]
+
+#     if data.items:
+#         items_payload = [
+#             {
+#                 "prescription_id": prescription_id,
+#                 "medicine_name":   item.medicine_name,
+#                 "dosage":          item.dosage,
+#                 "frequency":       item.frequency,
+#                 "duration_days":   item.duration_days,
+#                 "instructions":    item.instructions,
+#             }
+#             for item in data.items
+#         ]
+#         supabase.table("prescription_items").insert(items_payload).execute()
+
+#     full = supabase.table("prescriptions").select("*").eq("id", prescription_id).single().execute()
+#     items_res = supabase.table("prescription_items").select("*").eq("prescription_id", prescription_id).execute()
+#     return {**full.data, "items": items_res.data or []}
+
+
+# @router.get("/patient/{patient_id}")
+# async def get_patient_prescriptions(
+#     patient_id: str,
+#     limit: int = 10,
+#     current_user=Depends(get_current_user),
+# ):
+#     user = current_user
+#     role = user.get("role") or user.get("user_role")
+#     user_id = user.get("id")
+
+#     if role == "patient":
+#         # Patient can only see their own prescriptions
+#         if user_id != patient_id:
+#             raise HTTPException(
+#                 status_code=403,
+#                 detail="You can only view your own prescriptions",
+#             )
+
+#     elif role == "doctor":
+#         # Look up the doctor row using user_id (get_current_user returns a flat dict)
+#         doctor_res = (
+#             supabase.table("doctors")
+#             .select("id")
+#             .eq("user_id", user_id)
+#             .maybe_single()
+#             .execute()
+#         )
+#         if not doctor_res or not doctor_res.data:
+#             raise HTTPException(status_code=403, detail="Doctor record not found")
+
+#         doctor_db_id = doctor_res.data["id"]
+
+#         access = (
+#             supabase.table("appointments")
+#             .select("id")
+#             .eq("patient_id", patient_id)
+#             .eq("doctor_id", doctor_db_id)
+#             .not_.in_("status", ["cancelled", "no_show"])
+#             .limit(1)
+#             .execute()
+#         )
+#         if not access.data:
+#             raise HTTPException(
+#                 status_code=403,
+#                 detail="You are not the doctor of this patient",
+#             )
+
+#     else:
+#         # No recognised role — allow only if it's the user's own record
+#         if user_id != patient_id:
+#             raise HTTPException(
+#                 status_code=403,
+#                 detail="Access denied – you are not authorised to view these prescriptions",
+#             )
+
+#     res = (
+#         supabase.table("prescriptions")
+#         .select(
+#             "id, diagnosis, notes, follow_up_date, issued_at, "
+#             "doctors!prescriptions_doctor_id_fkey("
+#             "  specialty,"
+#             "  user_profiles!doctors_user_id_fkey(full_name)"
+#             ")"
+#         )
+#         .eq("patient_id", patient_id)
+#         .order("issued_at", desc=True)
+#         .limit(min(limit, 50))
+#         .execute()
+#     )
+
+#     prescriptions = []
+#     for p in res.data or []:
+#         items_res = (
+#             supabase.table("prescription_items")
+#             .select("medicine_name, dosage, frequency, duration_days, instructions")
+#             .eq("prescription_id", p["id"])
+#             .execute()
+#         )
+#         prescriptions.append({**p, "items": items_res.data or []})
+
+#     return prescriptions
+
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
-from datetime import date
 
 from app.core.dependencies import get_current_user, get_current_doctor
 from app.database.supabase_client import supabase
 from app.schemas.prescription import DirectPrescriptionCreate
+from app.utils.encryption import encrypt_text, decrypt_text
 
 router = APIRouter()
 
@@ -26,6 +173,7 @@ async def create_direct_prescription(
         .limit(1)
         .execute()
     )
+
     if not access.data:
         raise HTTPException(
             status_code=403,
@@ -33,15 +181,28 @@ async def create_direct_prescription(
         )
 
     prescription_payload = {
-        "patient_id":     data.patient_id,
-        "doctor_id":      doctor["id"],
-        "diagnosis":      data.diagnosis,
-        "notes":          data.notes,
-        "follow_up_date": data.follow_up_date.isoformat() if data.follow_up_date else None,
+        "patient_id": data.patient_id,
+        "doctor_id": doctor["id"],
+        "diagnosis": encrypt_text(data.diagnosis),
+        "notes": encrypt_text(data.notes) if data.notes else None,
+        "follow_up_date": (
+            data.follow_up_date.isoformat()
+            if data.follow_up_date
+            else None
+        ),
     }
-    res = supabase.table("prescriptions").insert(prescription_payload).execute()
+
+    res = (
+        supabase.table("prescriptions")
+        .insert(prescription_payload)
+        .execute()
+    )
+
     if not res.data:
-        raise HTTPException(status_code=500, detail="Failed to create prescription")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create prescription",
+        )
 
     prescription_id = res.data[0]["id"]
 
@@ -49,19 +210,66 @@ async def create_direct_prescription(
         items_payload = [
             {
                 "prescription_id": prescription_id,
-                "medicine_name":   item.medicine_name,
-                "dosage":          item.dosage,
-                "frequency":       item.frequency,
-                "duration_days":   item.duration_days,
-                "instructions":    item.instructions,
+                "medicine_name": encrypt_text(item.medicine_name),
+                "dosage": encrypt_text(item.dosage),
+                "frequency": encrypt_text(item.frequency),
+                "duration_days": item.duration_days,
+                "instructions": (
+                    encrypt_text(item.instructions)
+                    if item.instructions
+                    else None
+                ),
             }
             for item in data.items
         ]
-        supabase.table("prescription_items").insert(items_payload).execute()
 
-    full = supabase.table("prescriptions").select("*").eq("id", prescription_id).single().execute()
-    items_res = supabase.table("prescription_items").select("*").eq("prescription_id", prescription_id).execute()
-    return {**full.data, "items": items_res.data or []}
+        supabase.table("prescription_items").insert(
+            items_payload
+        ).execute()
+
+    full = (
+        supabase.table("prescriptions")
+        .select("*")
+        .eq("id", prescription_id)
+        .single()
+        .execute()
+    )
+
+    if full.data:
+        full.data["diagnosis"] = decrypt_text(
+            full.data.get("diagnosis")
+        )
+        full.data["notes"] = decrypt_text(
+            full.data.get("notes")
+        ) if full.data.get("notes") else None
+
+    items_res = (
+        supabase.table("prescription_items")
+        .select("*")
+        .eq("prescription_id", prescription_id)
+        .execute()
+    )
+
+    for item in items_res.data or []:
+        item["medicine_name"] = decrypt_text(
+            item.get("medicine_name")
+        )
+        item["dosage"] = decrypt_text(
+            item.get("dosage")
+        )
+        item["frequency"] = decrypt_text(
+            item.get("frequency")
+        )
+        item["instructions"] = (
+            decrypt_text(item.get("instructions"))
+            if item.get("instructions")
+            else None
+        )
+
+    return {
+        **full.data,
+        "items": items_res.data or [],
+    }
 
 
 @router.get("/patient/{patient_id}")
@@ -75,7 +283,6 @@ async def get_patient_prescriptions(
     user_id = user.get("id")
 
     if role == "patient":
-        # Patient can only see their own prescriptions
         if user_id != patient_id:
             raise HTTPException(
                 status_code=403,
@@ -83,7 +290,6 @@ async def get_patient_prescriptions(
             )
 
     elif role == "doctor":
-        # Look up the doctor row using user_id (get_current_user returns a flat dict)
         doctor_res = (
             supabase.table("doctors")
             .select("id")
@@ -91,8 +297,12 @@ async def get_patient_prescriptions(
             .maybe_single()
             .execute()
         )
-        if not doctor_res or not doctor_res.data:
-            raise HTTPException(status_code=403, detail="Doctor record not found")
+
+        if not doctor_res.data:
+            raise HTTPException(
+                status_code=403,
+                detail="Doctor record not found",
+            )
 
         doctor_db_id = doctor_res.data["id"]
 
@@ -105,6 +315,7 @@ async def get_patient_prescriptions(
             .limit(1)
             .execute()
         )
+
         if not access.data:
             raise HTTPException(
                 status_code=403,
@@ -112,7 +323,6 @@ async def get_patient_prescriptions(
             )
 
     else:
-        # No recognised role — allow only if it's the user's own record
         if user_id != patient_id:
             raise HTTPException(
                 status_code=403,
@@ -124,8 +334,8 @@ async def get_patient_prescriptions(
         .select(
             "id, diagnosis, notes, follow_up_date, issued_at, "
             "doctors!prescriptions_doctor_id_fkey("
-            "  specialty,"
-            "  user_profiles!doctors_user_id_fkey(full_name)"
+            "specialty,"
+            "user_profiles!doctors_user_id_fkey(full_name)"
             ")"
         )
         .eq("patient_id", patient_id)
@@ -135,13 +345,52 @@ async def get_patient_prescriptions(
     )
 
     prescriptions = []
+
     for p in res.data or []:
+
+        p["diagnosis"] = decrypt_text(
+            p.get("diagnosis")
+        )
+
+        p["notes"] = (
+            decrypt_text(p.get("notes"))
+            if p.get("notes")
+            else None
+        )
+
         items_res = (
             supabase.table("prescription_items")
-            .select("medicine_name, dosage, frequency, duration_days, instructions")
+            .select(
+                "medicine_name, dosage, frequency, duration_days, instructions"
+            )
             .eq("prescription_id", p["id"])
             .execute()
         )
-        prescriptions.append({**p, "items": items_res.data or []})
+
+        for item in items_res.data or []:
+            item["medicine_name"] = decrypt_text(
+                item.get("medicine_name")
+            )
+
+            item["dosage"] = decrypt_text(
+                item.get("dosage")
+            )
+
+            item["frequency"] = decrypt_text(
+                item.get("frequency")
+            )
+
+            item["instructions"] = (
+                decrypt_text(item.get("instructions"))
+                if item.get("instructions")
+                else None
+            )
+
+        prescriptions.append(
+            {
+                **p,
+                "items": items_res.data or [],
+            }
+        )
 
     return prescriptions
